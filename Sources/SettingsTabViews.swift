@@ -79,6 +79,7 @@ struct InfoTip: View {
                         .font(.callout)
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     if let onCopy = onCopy {
                         Button {
                             onCopy()
@@ -91,7 +92,10 @@ struct InfoTip: View {
                     }
                 }
                 .padding(12)
-                .frame(maxWidth: 300, alignment: .leading)
+                // 固定宽度，不能用 maxWidth：popover 会在极窄的宽度下量内容，文字按那个宽度折行
+                // 量出 ~2000pt 的高度，再按 300pt 宽画，结果是一个巨高的气泡、文字居中
+                //（macOS 27 实测：maxWidth 版在宽度 0 下量得 25×2034，固定宽度版恒为 300×84）。
+                .frame(width: 300, alignment: .leading)
                 .onDisappear { copied = false }
             }
     }
@@ -2011,6 +2015,7 @@ struct PermissionsTabView: View {
     @AppStorage("immurok.sshAgentEnabled") private var sshAgentEnabled = true
     @AppStorage("immurok.cliEnabled") private var cliEnabled = true
     @AppStorage("immurok.quickFillEnabled") private var quickFillEnabled = true
+    @AppStorage(AppDefaults.keepAwakeDuringDisplaySleepKey) private var keepAwakeDuringDisplaySleep = true
     // 强认证已启用后用户把顶部横幅收起（缩成右上角盾牌）
     @AppStorage("immurok.pamBannerDismissed") private var pamBannerDismissed = false
     // Empty string = silent. Read by AppDelegate.handleFingerprintMatch.
@@ -2021,6 +2026,9 @@ struct PermissionsTabView: View {
     // Read by AuthRequestOverlay.show.
     @AppStorage(AuthRequestOverlay.soundDefaultsKey)
     private var agentAuthSound = AuthRequestOverlay.defaultSoundName
+
+    // SSH Agent 开着、但 ssh 实际解析不到我们的 agent（见 SSHConfigManager）
+    @State private var sshConfigNeedsSetup = false
 
     // macOS built-in system sounds (/System/Library/Sounds/*.aiff)
     private static let systemSounds = [
@@ -2120,6 +2128,16 @@ struct PermissionsTabView: View {
                 }
             }
 
+            // 显示器关闭时保持 Mac 唤醒（保住 BLE 链路）；关掉则允许系统睡眠（issue #15）
+            GroupBox {
+                permissionRow(
+                    icon: "powersleep",
+                    titleKey: "permission.keepawake",
+                    hintKey: "permission.keepawake.hint",
+                    isOn: $keepAwakeDuringDisplaySleep
+                )
+            }
+
             // App Store / Passwords / 1Password / Bitwarden 的注入项已迁到 Automation tab
             // 统一管理（含用户自定义条目）。
 
@@ -2156,20 +2174,38 @@ struct PermissionsTabView: View {
 
             // SSH Agent — info icon shows export command + click copies it
             GroupBox {
-                permissionRow(
-                    icon: "network",
-                    titleKey: "permission.ssh.agent",
-                    hint: "export SSH_AUTH_SOCK=\(SSHAgentServer.shared.socketPath)",
-                    onInfoClick: {
-                        let cmd = "export SSH_AUTH_SOCK=\(SSHAgentServer.shared.socketPath)"
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(cmd, forType: .string)
-                    },
-                    isOn: Binding(
-                        get: { sshAgentEnabled },
-                        set: { toggleSSHAgent($0) }
+                VStack(spacing: 6) {
+                    permissionRow(
+                        icon: "network",
+                        titleKey: "permission.ssh.agent",
+                        hint: "export SSH_AUTH_SOCK=\(SSHAgentServer.shared.socketPath)",
+                        onInfoClick: {
+                            let cmd = "export SSH_AUTH_SOCK=\(SSHAgentServer.shared.socketPath)"
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(cmd, forType: .string)
+                        },
+                        isOn: Binding(
+                            get: { sshAgentEnabled },
+                            set: { toggleSSHAgent($0) }
+                        )
                     )
-                )
+                    // launchctl setenv 到不了从 Dock 启动的终端（Dock 带着登录时的旧
+                    // SSH_AUTH_SOCK 并转发给它启动的 App）。ssh 实际解析不到我们的 agent
+                    // 时提示，用户点了才往 ~/.ssh/config 写受管块。
+                    if sshConfigNeedsSetup {
+                        HStack(spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundColor(.orange)
+                            Text("permission.ssh.config.warning".localized)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            Button("permission.ssh.config.install".localized) {
+                                installSSHConfigAction()
+                            }
+                        }
+                    }
+                }
             }
 
             // imk CLI — 声音选择器控制 `imk run --agent` 弹出认证浮层时的提示音
@@ -2210,6 +2246,7 @@ struct PermissionsTabView: View {
         .padding(.bottom, 20)
         .overlay(alignment: .topTrailing) { pamCollapsedShield }
         }
+        .onAppear { refreshSSHConfigState() }
     }
 
     // MARK: - Section Header
@@ -2494,7 +2531,43 @@ struct PermissionsTabView: View {
         } else {
             SSHAgentServer.shared.stop()
             SSHAgentServer.shared.restoreAuthSockEnv()   // 关闭恢复原值
+            // 只删我们自己写的受管块；用户手写的 IdentityAgent 不动。
+            do {
+                try SSHConfigManager.remove()
+            } catch {
+                NSLog("SSHConfigManager: remove failed: %@", "\(error)")
+            }
         }
+        refreshSSHConfigState()
+    }
+
+    /// 重新判断 ssh 是否会走我们的 agent。要起 `ssh -G` 子进程，放后台队列。
+    private func refreshSSHConfigState() {
+        guard sshAgentEnabled else {
+            sshConfigNeedsSetup = false
+            return
+        }
+        let agentSock = SSHAgentServer.shared.socketPath
+        DispatchQueue.global(qos: .userInitiated).async {
+            // 只有「没配、跟着环境变量走」才提示；用户明确指向别的 agent 时不打扰。
+            let routing = SSHConfigManager.routing(agentSock: agentSock)
+            DispatchQueue.main.async {
+                // 检测期间开关可能已被关掉
+                sshConfigNeedsSetup = sshAgentEnabled && routing == .unset
+            }
+        }
+    }
+
+    private func installSSHConfigAction() {
+        do {
+            try SSHConfigManager.install(agentSock: SSHAgentServer.shared.socketPath)
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "permission.ssh.agent".localized
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
+        refreshSSHConfigState()
     }
 
     private func toggleCLI(_ enable: Bool) {
